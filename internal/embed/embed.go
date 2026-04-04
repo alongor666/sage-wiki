@@ -21,7 +21,7 @@ type Embedder interface {
 // Default embedding models per provider.
 var defaultModels = map[string]string{
 	"openai":  "text-embedding-3-small",
-	"gemini":  "text-embedding-004",
+	"gemini":  "gemini-embedding-2-preview",
 	"voyage":  "voyage-3-lite",
 	"mistral": "mistral-embed",
 }
@@ -29,7 +29,7 @@ var defaultModels = map[string]string{
 // Default dimensions per model.
 var defaultDimensions = map[string]int{
 	"text-embedding-3-small": 1536,
-	"text-embedding-004":     768,
+	"gemini-embedding-2-preview": 768,
 	"voyage-3-lite":          1024,
 	"mistral-embed":          1024,
 	"nomic-embed-text":       768,
@@ -81,6 +81,14 @@ func (e *APIEmbedder) Name() string     { return fmt.Sprintf("%s/%s", e.provider
 func (e *APIEmbedder) Dimensions() int  { return e.dims }
 
 func (e *APIEmbedder) Embed(text string) ([]float32, error) {
+	if e.provider == "gemini" {
+		return e.embedGemini(text)
+	}
+	return e.embedOpenAI(text)
+}
+
+// embedOpenAI uses the OpenAI-compatible /embeddings endpoint.
+func (e *APIEmbedder) embedOpenAI(text string) ([]float32, error) {
 	url := e.embeddingURL()
 
 	body, _ := json.Marshal(map[string]any{
@@ -94,7 +102,7 @@ func (e *APIEmbedder) Embed(text string) ([]float32, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	e.setAuthHeader(req)
+	req.Header.Set("Authorization", "Bearer "+e.apiKey)
 
 	resp, err := e.client.Do(req)
 	if err != nil {
@@ -123,14 +131,63 @@ func (e *APIEmbedder) Embed(text string) ([]float32, error) {
 	return result.Data[0].Embedding, nil
 }
 
+// embedGemini uses the Gemini-native /models/{model}:embedContent endpoint.
+func (e *APIEmbedder) embedGemini(text string) ([]float32, error) {
+	base := e.baseURL
+	if base == "" {
+		base = "https://generativelanguage.googleapis.com/v1beta"
+	}
+	url := fmt.Sprintf("%s/models/%s:embedContent?key=%s", base, e.model, e.apiKey)
+
+	body, _ := json.Marshal(map[string]any{
+		"model": "models/" + e.model,
+		"content": map[string]any{
+			"parts": []map[string]string{
+				{"text": text},
+			},
+		},
+	})
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("embed: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("embed: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("embed: API returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Embedding struct {
+			Values []float32 `json:"values"`
+		} `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("embed: decode response: %w", err)
+	}
+
+	if len(result.Embedding.Values) == 0 {
+		return nil, fmt.Errorf("embed: empty embedding in response")
+	}
+
+	e.dims = len(result.Embedding.Values)
+	return result.Embedding.Values, nil
+}
+
 func (e *APIEmbedder) embeddingURL() string {
 	base := e.baseURL
 	if base == "" {
 		switch e.provider {
 		case "openai":
 			base = "https://api.openai.com/v1"
-		case "gemini":
-			base = "https://generativelanguage.googleapis.com/v1beta"
 		case "voyage":
 			base = "https://api.voyageai.com/v1"
 		case "mistral":
@@ -138,18 +195,6 @@ func (e *APIEmbedder) embeddingURL() string {
 		}
 	}
 	return base + "/embeddings"
-}
-
-func (e *APIEmbedder) setAuthHeader(req *http.Request) {
-	switch e.provider {
-	case "gemini":
-		// Gemini uses query param
-		q := req.URL.Query()
-		q.Set("key", e.apiKey)
-		req.URL.RawQuery = q.Encode()
-	default:
-		req.Header.Set("Authorization", "Bearer "+e.apiKey)
-	}
 }
 
 // OllamaEmbedder uses a local Ollama instance.

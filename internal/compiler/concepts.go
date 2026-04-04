@@ -21,6 +21,8 @@ type ExtractedConcept struct {
 // ExtractConcepts runs Pass 2: concept extraction from summaries.
 // It takes new/updated summaries and the existing concept list,
 // asks the LLM to identify and deduplicate concepts.
+const conceptBatchSize = 20 // summaries per LLM call
+
 func ExtractConcepts(
 	summaries []SummaryResult,
 	existingConcepts map[string]manifest.Concept,
@@ -31,26 +33,53 @@ func ExtractConcepts(
 		return nil, nil
 	}
 
+	// Filter valid summaries
+	var validSummaries []SummaryResult
+	for _, s := range summaries {
+		if s.Error == nil && s.Summary != "" {
+			validSummaries = append(validSummaries, s)
+		}
+	}
+	if len(validSummaries) == 0 {
+		return nil, nil
+	}
+
 	// Build existing concept list for dedup context
 	var existingList []string
 	for name := range existingConcepts {
 		existingList = append(existingList, name)
 	}
 
-	// Build summary texts
-	var summaryTexts []string
-	for _, s := range summaries {
-		if s.Error != nil || s.Summary == "" {
-			continue
+	// Process in batches
+	var allConcepts []ExtractedConcept
+
+	for i := 0; i < len(validSummaries); i += conceptBatchSize {
+		end := i + conceptBatchSize
+		if end > len(validSummaries) {
+			end = len(validSummaries)
 		}
-		summaryTexts = append(summaryTexts, fmt.Sprintf("### Source: %s\n%s", s.SourcePath, s.Summary))
-	}
+		batch := validSummaries[i:end]
 
-	if len(summaryTexts) == 0 {
-		return nil, nil
-	}
+		log.Info("extracting concepts batch", "batch", i/conceptBatchSize+1, "summaries", len(batch), "total", len(validSummaries))
 
-	prompt := fmt.Sprintf(`Extract concepts from these summaries of recently added/modified sources.
+		var summaryTexts []string
+		for _, s := range batch {
+			// Use truncated summary to stay within context limits
+			summary := s.Summary
+			if len(summary) > 1000 {
+				summary = summary[:1000] + "\n..."
+			}
+			summaryTexts = append(summaryTexts, fmt.Sprintf("### Source: %s\n%s", s.SourcePath, summary))
+		}
+
+		// Include previously extracted concepts in the dedup list
+		dedup := make([]string, len(existingList))
+		copy(dedup, existingList)
+		for _, c := range allConcepts {
+			dedup = append(dedup, c.Name)
+		}
+
+		prompt := fmt.Sprintf(`Extract concepts from these summaries of recently added/modified sources.
 
 ## Existing concepts (do not duplicate — merge with these when appropriate):
 %s
@@ -66,26 +95,78 @@ For each concept, provide:
 
 Merge with existing concepts when you detect aliases or synonyms.
 Output ONLY a JSON array of objects. No markdown, no explanation.`,
-		strings.Join(existingList, ", "),
-		strings.Join(summaryTexts, "\n\n---\n\n"),
-	)
+			strings.Join(dedup, ", "),
+			strings.Join(summaryTexts, "\n\n---\n\n"),
+		)
 
-	resp, err := client.ChatCompletion([]llm.Message{
-		{Role: "system", Content: "You are a concept extraction system for a knowledge wiki. Output valid JSON only."},
-		{Role: "user", Content: prompt},
-	}, llm.CallOpts{Model: model, MaxTokens: 4096})
-	if err != nil {
-		return nil, fmt.Errorf("concept extraction LLM call: %w", err)
+		resp, err := client.ChatCompletion([]llm.Message{
+			{Role: "system", Content: "You are a concept extraction system for a knowledge wiki. Output valid JSON only."},
+			{Role: "user", Content: prompt},
+		}, llm.CallOpts{Model: model, MaxTokens: 8192})
+		if err != nil {
+			log.Error("concept extraction batch failed", "batch", i/conceptBatchSize+1, "error", err)
+			continue // skip failed batch, continue with others
+		}
+
+		concepts, err := parseConceptsJSON(resp.Content)
+		if err != nil {
+			log.Error("concept extraction parse failed", "batch", i/conceptBatchSize+1, "error", err)
+			continue
+		}
+
+		allConcepts = append(allConcepts, concepts...)
+		log.Info("batch concepts extracted", "batch", i/conceptBatchSize+1, "count", len(concepts))
 	}
 
-	// Parse JSON response — try to extract JSON array from response
-	concepts, err := parseConceptsJSON(resp.Content)
-	if err != nil {
-		return nil, fmt.Errorf("concept extraction parse: %w", err)
+	// Deduplicate across batches
+	allConcepts = deduplicateConcepts(allConcepts)
+
+	log.Info("concepts extracted", "total", len(allConcepts))
+	return allConcepts, nil
+}
+
+// deduplicateConcepts merges concepts with the same name across batches.
+func deduplicateConcepts(concepts []ExtractedConcept) []ExtractedConcept {
+	seen := map[string]*ExtractedConcept{}
+	var result []ExtractedConcept
+
+	for _, c := range concepts {
+		if existing, ok := seen[c.Name]; ok {
+			// Merge sources
+			srcSet := map[string]bool{}
+			for _, s := range existing.Sources {
+				srcSet[s] = true
+			}
+			for _, s := range c.Sources {
+				if !srcSet[s] {
+					existing.Sources = append(existing.Sources, s)
+				}
+			}
+			// Merge aliases
+			aliasSet := map[string]bool{}
+			for _, a := range existing.Aliases {
+				aliasSet[a] = true
+			}
+			for _, a := range c.Aliases {
+				if !aliasSet[a] {
+					existing.Aliases = append(existing.Aliases, a)
+				}
+			}
+		} else {
+			copy := c
+			seen[c.Name] = &copy
+			result = append(result, copy)
+		}
 	}
 
-	log.Info("concepts extracted", "count", len(concepts))
-	return concepts, nil
+	// Apply merged data back
+	for i := range result {
+		if merged, ok := seen[result[i].Name]; ok {
+			result[i] = *merged
+		}
+	}
+
+	return result
 }
 
 // parseConceptsJSON extracts a JSON array from the LLM response.

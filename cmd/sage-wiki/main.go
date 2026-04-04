@@ -113,6 +113,8 @@ func init() {
 	compileCmd.Flags().Bool("watch", false, "Watch for changes and recompile")
 	compileCmd.Flags().Bool("dry-run", false, "Show what would change without writing")
 	compileCmd.Flags().Bool("fresh", false, "Ignore checkpoint, clean compile")
+	compileCmd.Flags().Bool("re-embed", false, "Re-generate embeddings for all entries without recompiling")
+	compileCmd.Flags().Bool("re-extract", false, "Re-run concept extraction and article writing from existing summaries")
 
 	// Serve flags
 	serveCmd.Flags().String("transport", "stdio", "Transport: stdio or sse")
@@ -192,6 +194,27 @@ func runCompile(cmd *cobra.Command, args []string) error {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	fresh, _ := cmd.Flags().GetBool("fresh")
 	watch, _ := cmd.Flags().GetBool("watch")
+
+	reEmbed, _ := cmd.Flags().GetBool("re-embed")
+	if reEmbed {
+		count, err := compiler.ReEmbed(dir)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Re-embedded %d entries.\n", count)
+		return nil
+	}
+
+	reExtract, _ := cmd.Flags().GetBool("re-extract")
+	if reExtract {
+		result, err := compiler.ReExtract(dir)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Re-extract complete: %d concepts, %d articles, %d errors\n",
+			result.ConceptsExtracted, result.ArticlesWritten, result.Errors)
+		return nil
+	}
 
 	if watch {
 		fmt.Println("Watching for changes... (Ctrl+C to stop)")

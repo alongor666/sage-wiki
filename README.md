@@ -25,12 +25,15 @@ sage-wiki init
 # Add sources to raw/
 cp ~/papers/*.pdf raw/papers/
 cp ~/articles/*.md raw/articles/
-# Compile
+# Edit config.yaml to add api key, and pick LLMs
+# First Compile
 sage-wiki compile
 # Search
 sage-wiki search "attention mechanism"
 # Ask questions
 sage-wiki query "How does flash attention optimize memory?"
+# Watch folder
+sage-wiki compile --watch
 ```
 
 ### Vault Overlay (existing Obsidian vault)
@@ -38,7 +41,10 @@ sage-wiki query "How does flash attention optimize memory?"
 ```bash
 cd ~/Documents/MyVault
 sage-wiki init --vault
-# Edit config.yaml to set source/ignore folders
+# Edit config.yaml to set source/ignore folders, add api key, pick LLMs
+# First Compile
+sage-wiki compile
+# Watch the vault
 sage-wiki compile --watch
 ```
 
