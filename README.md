@@ -9,6 +9,8 @@ Drop in your papers, articles, and notes. sage-wiki compiles them into a structu
 - **Works with your tools.** Opens natively in Obsidian. Connects to any LLM agent via MCP. Runs as a single binary — nothing to install beyond the API key.
 - **Ask your wiki questions.** Search across everything with hybrid BM25 + semantic search, or ask natural language questions and get cited answers.
 
+https://github.com/user-attachments/assets/c35ee202-e9df-4ccd-b520-8f057163ff26
+
 ## Install
 
 ```bash
