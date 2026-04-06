@@ -58,10 +58,11 @@ func ReEmbed(projectDir string) (int, error) {
 	log.Info("re-embedding entries", "count", len(entries), "provider", embedder.Name())
 
 	embedded := 0
-	for _, e := range entries {
+	total := len(entries)
+	for i, e := range entries {
 		vec, err := embedder.Embed(e.content)
 		if err != nil {
-			log.Warn("embedding failed", "id", e.id, "error", err)
+			log.Warn("embedding failed", "progress", fmt.Sprintf("%d/%d", i+1, total), "id", e.id, "error", err)
 			continue
 		}
 		if err := vecStore.Upsert(e.id, vec); err != nil {
@@ -69,9 +70,7 @@ func ReEmbed(projectDir string) (int, error) {
 			continue
 		}
 		embedded++
-		if embedded%10 == 0 {
-			log.Info("progress", "embedded", embedded, "total", len(entries))
-		}
+		log.Info("embedded", "progress", fmt.Sprintf("%d/%d", i+1, total), "id", e.id)
 	}
 
 	log.Info("re-embedding complete", "embedded", embedded, "total", len(entries))

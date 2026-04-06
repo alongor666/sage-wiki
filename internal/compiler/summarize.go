@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xoai/sage-wiki/internal/extract"
 	"github.com/xoai/sage-wiki/internal/llm"
@@ -40,6 +41,8 @@ func Summarize(
 	results := make([]SummaryResult, len(sources))
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
+	var done atomic.Int32
+	total := len(sources)
 
 	for i, src := range sources {
 		wg.Add(1)
@@ -52,10 +55,11 @@ func Summarize(
 			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens)
 			results[idx] = result
 
+			n := int(done.Add(1))
 			if result.Error != nil {
-				log.Error("summarize failed", "source", info.Path, "error", result.Error)
+				log.Error("summarize failed", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path, "error", result.Error)
 			} else {
-				log.Info("summarized", "source", info.Path, "summary", result.SummaryPath)
+				log.Info("summarized", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path)
 			}
 		}(i, src)
 	}

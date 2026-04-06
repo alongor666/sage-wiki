@@ -1,8 +1,12 @@
 package compiler
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +17,8 @@ import (
 )
 
 // Watch monitors source directories for changes and triggers compilation.
+// It tries fsnotify first, then falls back to polling if no events are
+// received (common on WSL2 /mnt/ paths and network drives).
 func Watch(projectDir string, debounceSeconds int) error {
 	if debounceSeconds <= 0 {
 		debounceSeconds = 2
@@ -24,22 +30,59 @@ func Watch(projectDir string, debounceSeconds int) error {
 		return err
 	}
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	defer watcher.Close()
-
-	// Add source directories recursively
 	sourcePaths := cfg.ResolveSources(projectDir)
-	for _, sp := range sourcePaths {
-		if err := addRecursive(watcher, sp); err != nil {
-			log.Warn("failed to watch directory", "path", sp, "error", err)
+
+	// Run initial compile to catch files added while watcher was stopped
+	log.Info("running initial compile before watching")
+	if result, err := Compile(projectDir, CompileOpts{}); err != nil {
+		log.Error("initial compile failed", "error", err)
+	} else if result.Added > 0 || result.Modified > 0 || result.Removed > 0 {
+		log.Info("initial compile complete",
+			"added", result.Added,
+			"summarized", result.Summarized,
+			"concepts", result.ConceptsExtracted,
+			"articles", result.ArticlesWritten,
+		)
+	} else {
+		log.Info("initial compile: nothing new to process")
+	}
+
+	// Try fsnotify first
+	watcher, fsErr := fsnotify.NewWatcher()
+	if fsErr == nil {
+		for _, sp := range sourcePaths {
+			addRecursive(watcher, sp)
 		}
 	}
 
-	log.Info("watching for changes", "sources", sourcePaths, "debounce", debounceSeconds)
+	// Start polling as primary or fallback
+	// On WSL2 with /mnt/ paths, fsnotify silently fails to deliver events
+	usePolling := fsErr != nil
+	if !usePolling {
+		// Detect if we're on a path where inotify won't work
+		for _, sp := range sourcePaths {
+			if strings.HasPrefix(sp, "/mnt/") {
+				usePolling = true
+				break
+			}
+		}
+	}
 
+	if usePolling {
+		if watcher != nil {
+			watcher.Close()
+		}
+		log.Info("using polling mode (inotify unavailable for these paths)", "sources", sourcePaths, "interval", fmt.Sprintf("%ds", debounceSeconds*2))
+		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2)
+	}
+
+	defer watcher.Close()
+	log.Info("watching for changes (fsnotify)", "sources", sourcePaths, "debounce", debounceSeconds)
+	return watchFsnotify(projectDir, watcher, debounceSeconds)
+}
+
+// watchFsnotify uses inotify-based watching (works on native Linux, macOS).
+func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int) error {
 	debounce := time.Duration(debounceSeconds) * time.Second
 	var timer *time.Timer
 	var compileMu sync.Mutex
@@ -57,36 +100,22 @@ func Watch(projectDir string, debounceSeconds int) error {
 				continue
 			}
 
-			log.Debug("file change detected", "path", event.Name, "op", event.Op)
+			log.Info("file change detected", "path", event.Name, "op", event.Op.String())
+
+			if event.Op&fsnotify.Create != 0 {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					watcher.Add(event.Name)
+				}
+			}
+
 			lastTrigger = event.Name
 
-			// Reset debounce timer
 			if timer != nil {
 				timer.Stop()
 			}
 			trigger := lastTrigger
 			timer = time.AfterFunc(debounce, func() {
-				// Prevent overlapping compiles
-				if compiling.Load() {
-					log.Info("compile already in progress, skipping", "trigger", trigger)
-					return
-				}
-				compileMu.Lock()
-				defer compileMu.Unlock()
-				compiling.Store(true)
-				defer compiling.Store(false)
-
-				log.Info("compiling after change", "trigger", trigger)
-				result, err := Compile(projectDir, CompileOpts{})
-				if err != nil {
-					log.Error("compile failed", "error", err)
-				} else {
-					log.Info("compile complete",
-						"summarized", result.Summarized,
-						"concepts", result.ConceptsExtracted,
-						"articles", result.ArticlesWritten,
-					)
-				}
+				triggerCompile(projectDir, trigger, &compileMu, &compiling)
 			})
 
 		case err, ok := <-watcher.Errors:
@@ -95,6 +124,129 @@ func Watch(projectDir string, debounceSeconds int) error {
 			}
 			log.Error("watcher error", "error", err)
 		}
+	}
+}
+
+// watchPoll periodically scans source directories for changes.
+// Works on WSL2 /mnt/ paths, network drives, and any filesystem.
+func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int) error {
+	var compileMu sync.Mutex
+	var compiling atomic.Bool
+
+	// Build initial snapshot
+	snapshot := scanSnapshot(sourcePaths, ignore)
+	log.Info("initial snapshot", "files", len(snapshot))
+
+	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		newSnapshot := scanSnapshot(sourcePaths, ignore)
+
+		// Detect changes
+		var changed []string
+
+		// New or modified files
+		for path, hash := range newSnapshot {
+			if oldHash, exists := snapshot[path]; !exists {
+				changed = append(changed, path)
+				log.Info("new file detected", "path", path)
+			} else if oldHash != hash {
+				changed = append(changed, path)
+				log.Info("file modified", "path", path)
+			}
+		}
+
+		// Deleted files
+		for path := range snapshot {
+			if _, exists := newSnapshot[path]; !exists {
+				changed = append(changed, path)
+				log.Info("file removed", "path", path)
+			}
+		}
+
+		snapshot = newSnapshot
+
+		if len(changed) > 0 {
+			log.Info("changes detected", "count", len(changed))
+			triggerCompile(projectDir, changed[0], &compileMu, &compiling)
+		}
+	}
+
+	return nil
+}
+
+// scanSnapshot builds a map of file path → content hash for all source files.
+func scanSnapshot(sourcePaths []string, ignore []string) map[string]string {
+	snapshot := make(map[string]string)
+
+	for _, dir := range sourcePaths {
+		filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+
+			// Check ignore list
+			for _, ign := range ignore {
+				if strings.Contains(path, ign) {
+					return nil
+				}
+			}
+
+			hash := quickHash(path)
+			if hash != "" {
+				snapshot[path] = hash
+			}
+			return nil
+		})
+	}
+
+	return snapshot
+}
+
+// quickHash returns a fast hash of file metadata (size + modtime).
+// Avoids reading file contents for performance on large vaults.
+func quickHash(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	// Use size + modtime as a fast change indicator
+	return fmt.Sprintf("%d-%d", info.Size(), info.ModTime().UnixNano())
+}
+
+// fullHash reads the file and returns SHA-256 (used when content comparison needed).
+func fullHash(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func triggerCompile(projectDir string, trigger string, compileMu *sync.Mutex, compiling *atomic.Bool) {
+	if compiling.Load() {
+		log.Info("compile already in progress, skipping", "trigger", trigger)
+		return
+	}
+	compileMu.Lock()
+	defer compileMu.Unlock()
+	compiling.Store(true)
+	defer compiling.Store(false)
+
+	log.Info("compiling after change", "trigger", trigger)
+	result, err := Compile(projectDir, CompileOpts{})
+	if err != nil {
+		log.Error("compile failed", "error", err)
+	} else {
+		log.Info("compile complete",
+			"summarized", result.Summarized,
+			"concepts", result.ConceptsExtracted,
+			"articles", result.ArticlesWritten,
+		)
 	}
 }
 

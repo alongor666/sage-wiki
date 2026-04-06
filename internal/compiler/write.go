@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xoai/sage-wiki/internal/embed"
 	"github.com/xoai/sage-wiki/internal/llm"
@@ -43,6 +44,8 @@ func WriteArticles(
 	results := make([]ArticleResult, len(concepts))
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
+	var done atomic.Int32
+	total := len(concepts)
 
 	for i, concept := range concepts {
 		wg.Add(1)
@@ -55,10 +58,11 @@ func WriteArticles(
 			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder)
 			results[idx] = result
 
+			n := int(done.Add(1))
 			if result.Error != nil {
-				log.Error("write article failed", "concept", c.Name, "error", result.Error)
+				log.Error("write article failed", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name, "error", result.Error)
 			} else {
-				log.Info("article written", "concept", c.Name, "path", result.ArticlePath)
+				log.Info("article written", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name)
 			}
 		}(i, concept)
 	}

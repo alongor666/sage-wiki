@@ -137,32 +137,39 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 			StartedAt: timeNow(),
 			Pass:      1,
 		}
-		for _, s := range diff.Added {
-			state.Pending = append(state.Pending, s.Path)
-		}
-		for _, s := range diff.Modified {
-			state.Pending = append(state.Pending, s.Path)
-		}
 	}
 
-	// Filter to only pending sources (for resume)
+	// Merge new files from diff into checkpoint pending list
+	// This handles files added while the watcher was stopped
+	completedSet := make(map[string]bool)
+	for _, p := range state.Completed {
+		completedSet[p] = true
+	}
 	pendingSet := make(map[string]bool)
 	for _, p := range state.Pending {
 		pendingSet[p] = true
 	}
+	for _, s := range append(diff.Added, diff.Modified...) {
+		if !completedSet[s.Path] && !pendingSet[s.Path] {
+			state.Pending = append(state.Pending, s.Path)
+			pendingSet[s.Path] = true
+			log.Info("new source added to compile queue", "path", s.Path)
+		}
+	}
 
+	// If new files were added, reset pass to 1 so they get summarized
+	newFiles := false
 	var toProcess []SourceInfo
 	for _, s := range append(diff.Added, diff.Modified...) {
 		if pendingSet[s.Path] {
 			toProcess = append(toProcess, s)
+			if !completedSet[s.Path] {
+				newFiles = true
+			}
 		}
 	}
-
-	// Pass 1: Summarize (skip if checkpoint says Pass 1 already done)
-	if state.Pass > 1 {
-		log.Info("Pass 1: skipping (checkpoint indicates already complete)")
-	}
-	if state.Pass <= 1 && len(toProcess) > 0 {
+	if newFiles && state.Pass > 1 {
+		log.Info("new sources detected, resetting to Pass 1")
 		state.Pass = 1
 	}
 	log.Info("Pass 1: summarizing sources", "count", len(toProcess))
