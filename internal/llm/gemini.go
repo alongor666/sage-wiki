@@ -22,8 +22,7 @@ func newGeminiProvider(apiKey string, baseURL string) *geminiProvider {
 func (p *geminiProvider) Name() string        { return "gemini" }
 func (p *geminiProvider) SupportsVision() bool { return true }
 
-func (p *geminiProvider) FormatRequest(messages []Message, opts CallOpts) (*http.Request, error) {
-	// Convert messages to Gemini format
+func (p *geminiProvider) formatBody(messages []Message, opts CallOpts) (map[string]any, string) {
 	var contents []map[string]any
 	var systemInstruction string
 
@@ -89,6 +88,12 @@ func (p *geminiProvider) FormatRequest(messages []Message, opts CallOpts) (*http
 		model = "gemini-2.0-flash"
 	}
 
+	return body, model
+}
+
+func (p *geminiProvider) FormatRequest(messages []Message, opts CallOpts) (*http.Request, error) {
+	body, model := p.formatBody(messages, opts)
+
 	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", p.baseURL, model, p.apiKey)
 
 	req, err := http.NewRequest("POST", url, jsonBody(body))
@@ -97,8 +102,46 @@ func (p *geminiProvider) FormatRequest(messages []Message, opts CallOpts) (*http
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-
 	return req, nil
+}
+
+func (p *geminiProvider) FormatStreamRequest(messages []Message, opts CallOpts) (*http.Request, error) {
+	body, model := p.formatBody(messages, opts)
+
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?key=%s&alt=sse", p.baseURL, model, p.apiKey)
+
+	req, err := http.NewRequest("POST", url, jsonBody(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+func (p *geminiProvider) ParseStreamChunk(data []byte) (string, bool) {
+	var chunk struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+			FinishReason string `json:"finishReason"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return "", false
+	}
+	if len(chunk.Candidates) == 0 {
+		return "", false
+	}
+	var text string
+	for _, part := range chunk.Candidates[0].Content.Parts {
+		text += part.Text
+	}
+	done := chunk.Candidates[0].FinishReason == "STOP" || chunk.Candidates[0].FinishReason == "MAX_TOKENS"
+	return text, done
 }
 
 func (p *geminiProvider) ParseResponse(body []byte) (*Response, error) {

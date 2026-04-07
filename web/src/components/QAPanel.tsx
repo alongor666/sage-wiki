@@ -6,18 +6,38 @@ interface Props {
   onNavigate: (path: string) => void;
 }
 
+// Keep answer state outside component so it survives remounts (hot reload)
+let persistedAnswer = '';
+let persistedSources: string[] = [];
+
 export function QAPanel({ onNavigate }: Props) {
   const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState('');
-  const [sources, setSources] = useState<string[]>([]);
+  const [answer, setAnswer] = useState(persistedAnswer);
+  const [sources, setSources] = useState<string[]>(persistedSources);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
+  const answerRef = useRef<HTMLDivElement>(null);
 
   // Abort streaming on unmount
   useEffect(() => {
     return () => { controllerRef.current?.abort(); };
   }, []);
+
+  // Auto-scroll answer area as tokens stream in
+  useEffect(() => {
+    if (answerRef.current && loading) {
+      answerRef.current.scrollTop = answerRef.current.scrollHeight;
+    }
+  }, [answer, loading]);
+
+  // Persist answer across remounts
+  useEffect(() => {
+    persistedAnswer = answer;
+  }, [answer]);
+  useEffect(() => {
+    persistedSources = sources;
+  }, [sources]);
 
   const handleSubmit = (e: Event) => {
     e.preventDefault();
@@ -30,6 +50,8 @@ export function QAPanel({ onNavigate }: Props) {
     setSources([]);
     setError(null);
     setLoading(true);
+    persistedAnswer = '';
+    persistedSources = [];
 
     controllerRef.current = streamQuery(question, 5, {
       onToken: (text) => {
@@ -49,8 +71,7 @@ export function QAPanel({ onNavigate }: Props) {
   };
 
   const handleSourceClick = (path: string) => {
-    // Convert wiki/concepts/foo.md → concepts/foo.md
-    const articlePath = path.replace(/^wiki\//, '');
+    const articlePath = path.replace(/^wiki\//, '').replace(/^_wiki\//, '');
     onNavigate(articlePath);
   };
 
@@ -68,7 +89,22 @@ export function QAPanel({ onNavigate }: Props) {
     <div class="border-t border-gray-200 dark:border-gray-700 flex flex-col max-h-[40vh]">
       {/* Answer area */}
       {(answer || loading || error) && (
-        <div class="flex-1 overflow-y-auto px-6 py-4 min-h-0">
+        <div ref={answerRef} class="flex-1 overflow-y-auto px-6 py-4 min-h-0 relative">
+          <button
+            onClick={() => {
+              controllerRef.current?.abort();
+              setAnswer('');
+              setSources([]);
+              setError(null);
+              setLoading(false);
+              persistedAnswer = '';
+              persistedSources = [];
+            }}
+            class="absolute top-2 right-2 p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+            title="Close"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
           {error && (
             <div class="text-red-500 text-sm mb-2">Error: {error}</div>
           )}

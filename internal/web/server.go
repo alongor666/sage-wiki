@@ -322,14 +322,17 @@ func (s *WebServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var hits []searchHit
+	outputPrefix := s.cfg.Output + "/"
 	for _, r := range results {
 		snippet := r.Content
 		if len(snippet) > 200 {
 			snippet = snippet[:200] + "..."
 		}
+		// Strip output dir prefix so paths are relative (e.g. "summaries/foo.md" not "_wiki/summaries/foo.md")
+		articlePath := strings.TrimPrefix(r.ArticlePath, outputPrefix)
 		hits = append(hits, searchHit{
 			ID:      r.ID,
-			Path:    r.ArticlePath,
+			Path:    articlePath,
 			Snippet: snippet,
 			Score:   r.RRFScore,
 		})

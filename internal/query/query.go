@@ -264,7 +264,7 @@ format: %s
 	return relPath, nil
 }
 
-// StreamQuery performs Q&A with streaming token output. Does not auto-file.
+// StreamQuery performs Q&A with streaming token output and auto-files to outputs/.
 // The context is used to cancel the LLM call on client disconnect.
 func StreamQuery(ctx context.Context, projectDir string, question string, topK int, tokenCB func(string), db *storage.DB) ([]string, error) {
 	if topK <= 0 {
@@ -313,9 +313,28 @@ func StreamQuery(ctx context.Context, projectDir string, question string, topK i
 		{Role: "user", Content: fmt.Sprintf("Question: %s\n\n## Wiki Context:\n\n%s", question, contextStr)},
 	}
 
-	_, err = client.ChatCompletionStream(ctx, messages, llm.CallOpts{Model: model, MaxTokens: 4000}, tokenCB)
+	resp, err := client.ChatCompletionStream(ctx, messages, llm.CallOpts{Model: model, MaxTokens: 4000}, tokenCB)
 	if err != nil {
 		return sources, fmt.Errorf("query: LLM stream: %w", err)
+	}
+
+	// Auto-file the result to outputs/
+	if resp != nil && resp.Content != "" {
+		result := &QueryResult{
+			Question: question,
+			Answer:   resp.Content,
+			Sources:  sources,
+			Format:   "markdown",
+		}
+		memStore := memory.NewStore(db)
+		vecStore := vectors.NewStore(db)
+		ontStore := ontology.NewStore(db)
+		embedder := embed.NewFromConfig(cfg)
+		if outputPath, err := autoFile(projectDir, cfg.Output, result, memStore, vecStore, ontStore, embedder); err != nil {
+			log.Warn("stream auto-filing failed", "error", err)
+		} else {
+			log.Info("stream query result filed", "path", outputPath)
+		}
 	}
 
 	return sources, nil
