@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 )
 
@@ -119,6 +120,95 @@ func (p *geminiProvider) FormatStreamRequest(messages []Message, opts CallOpts) 
 	return req, nil
 }
 
+// --- CachingProvider implementation ---
+
+func (p *geminiProvider) SetupCache(systemPrompt string, model string) (string, error) {
+	if model == "" {
+		model = "gemini-2.5-flash"
+	}
+
+	body := map[string]any{
+		"model": "models/" + model,
+		"contents": []map[string]any{
+			{
+				"role":  "user",
+				"parts": []map[string]string{{"text": systemPrompt}},
+			},
+		},
+	}
+
+	url := fmt.Sprintf("%s/cachedContents?key=%s", p.baseURL, p.apiKey)
+	req, err := http.NewRequest("POST", url, jsonBody(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gemini: cache setup request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gemini: cache setup failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("gemini: parse cache response: %w", err)
+	}
+
+	return result.Name, nil
+}
+
+func (p *geminiProvider) FormatCachedRequest(cacheID string, messages []Message, opts CallOpts) (*http.Request, error) {
+	if cacheID == "" {
+		// No cache — use regular request
+		return p.FormatRequest(messages, opts)
+	}
+
+	body, model := p.formatBody(messages, opts)
+	body["cachedContent"] = cacheID
+
+	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", p.baseURL, model, p.apiKey)
+
+	req, err := http.NewRequest("POST", url, jsonBody(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+func (p *geminiProvider) TeardownCache(cacheID string) error {
+	if cacheID == "" {
+		return nil
+	}
+
+	url := fmt.Sprintf("%s/%s?key=%s", p.baseURL, cacheID, p.apiKey)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("gemini: cache teardown failed: %w", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("gemini: cache delete returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (p *geminiProvider) ParseStreamChunk(data []byte) (string, bool) {
 	var chunk struct {
 		Candidates []struct {
@@ -163,7 +253,10 @@ func (p *geminiProvider) ParseResponse(body []byte) (*Response, error) {
 			Status  string `json:"status"`
 		} `json:"error"`
 		UsageMetadata struct {
-			TotalTokenCount int `json:"totalTokenCount"`
+			PromptTokenCount     int `json:"promptTokenCount"`
+			CandidatesTokenCount int `json:"candidatesTokenCount"`
+			TotalTokenCount      int `json:"totalTokenCount"`
+			CachedContentTokenCount int `json:"cachedContentTokenCount"`
 		} `json:"usageMetadata"`
 		ModelVersion string `json:"modelVersion"`
 	}
@@ -215,5 +308,10 @@ func (p *geminiProvider) ParseResponse(body []byte) (*Response, error) {
 		Content:    text,
 		Model:      result.ModelVersion,
 		TokensUsed: result.UsageMetadata.TotalTokenCount,
+		Usage: Usage{
+			InputTokens:  result.UsageMetadata.PromptTokenCount,
+			OutputTokens: result.UsageMetadata.CandidatesTokenCount,
+			CachedTokens: result.UsageMetadata.CachedContentTokenCount,
+		},
 	}, nil
 }

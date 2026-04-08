@@ -24,8 +24,9 @@ import (
 
 // CompileOpts configures a compilation run.
 type CompileOpts struct {
-	DryRun bool
-	Fresh  bool // ignore checkpoint
+	DryRun  bool
+	Fresh   bool           // ignore checkpoint
+	Tracker *llm.CostTracker // optional cost tracker
 }
 
 // CompileResult summarizes what happened during compilation.
@@ -127,6 +128,13 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		return nil, fmt.Errorf("compile: create LLM client: %w", err)
 	}
 
+	// Attach cost tracker
+	tracker := opts.Tracker
+	if tracker == nil {
+		tracker = llm.NewCostTracker(cfg.API.Provider, 0)
+	}
+	client.SetTracker(tracker)
+
 	// Open DB
 	dbPath := filepath.Join(projectDir, ".sage", "wiki.db")
 	db, err := storage.Open(dbPath)
@@ -181,6 +189,9 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		log.Info("new sources detected, resetting to Pass 1")
 		state.Pass = 1
 	}
+	client.SetPass("summarize")
+	// Setup prompt cache for summarize pass
+	sumCacheID, _ := client.SetupCache("You are a research assistant creating structured summaries for a personal knowledge wiki.", cfg.Models.Summarize)
 	progress.StartPhase("Pass 1: Summarize sources", len(toProcess))
 
 	model := cfg.Models.Summarize
@@ -250,6 +261,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	}
 
 	// Update checkpoint pass
+	client.TeardownCache(sumCacheID)
 	state.Pass = 2
 	saveCompileState(statePath, state)
 
@@ -261,6 +273,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 			extractModel = model
 		}
 
+		client.SetPass("extract")
+		extCacheID, _ := client.SetupCache("You are an expert knowledge organizer. Extract structured concepts from source summaries.", extractModel)
 		progress.StartPhase("Pass 2: Extract concepts", len(successfulSummaries))
 		concepts, err := ExtractConcepts(successfulSummaries, mf.Concepts, client, extractModel)
 		if err != nil {
@@ -277,6 +291,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 			}
 			progress.ConceptsDiscovered(conceptNames)
 			progress.EndPhase()
+			client.TeardownCache(extCacheID)
 
 			// Pass 3: Write articles
 			if len(concepts) > 0 {
@@ -291,6 +306,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 
 				ontStore := ontology.NewStore(db)
 
+				client.SetPass("write")
+				writeCacheID, _ := client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
 				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder)
 
@@ -304,6 +321,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 					}
 				}
 				progress.EndPhase()
+				client.TeardownCache(writeCacheID)
 			}
 		}
 	}
@@ -344,6 +362,12 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	}
 
 	progress.Summary(result)
+
+	// Print cost report
+	costReport := tracker.Report()
+	if costReport.TotalTokens > 0 {
+		fmt.Fprint(os.Stderr, llm.FormatReport(costReport))
+	}
 
 	return result, nil
 }

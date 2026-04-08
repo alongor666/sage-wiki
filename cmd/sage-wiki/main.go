@@ -14,6 +14,8 @@ import (
 	"github.com/xoai/sage-wiki/internal/config"
 	"github.com/xoai/sage-wiki/internal/hybrid"
 	"github.com/xoai/sage-wiki/internal/linter"
+	"github.com/xoai/sage-wiki/internal/llm"
+	"github.com/xoai/sage-wiki/internal/manifest"
 	"github.com/xoai/sage-wiki/internal/memory"
 	mcppkg "github.com/xoai/sage-wiki/internal/mcp"
 	"github.com/xoai/sage-wiki/internal/prompts"
@@ -126,6 +128,7 @@ func init() {
 	compileCmd.Flags().Bool("fresh", false, "Ignore checkpoint, clean compile")
 	compileCmd.Flags().Bool("re-embed", false, "Re-generate embeddings for all entries without recompiling")
 	compileCmd.Flags().Bool("re-extract", false, "Re-run concept extraction and article writing from existing summaries")
+	compileCmd.Flags().Bool("estimate", false, "Show cost estimate without compiling")
 
 	// Serve flags
 	serveCmd.Flags().String("transport", "stdio", "Transport: stdio or sse")
@@ -239,6 +242,11 @@ func runCompile(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Re-extract complete: %d concepts, %d articles, %d errors\n",
 			result.ConceptsExtracted, result.ArticlesWritten, result.Errors)
 		return nil
+	}
+
+	estimate, _ := cmd.Flags().GetBool("estimate")
+	if estimate {
+		return runEstimate(dir)
 	}
 
 	if watch {
@@ -437,6 +445,62 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if result.HasErrors() {
 		return fmt.Errorf("doctor found errors")
 	}
+	return nil
+}
+
+func runEstimate(dir string) error {
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	mfPath := filepath.Join(dir, ".manifest.json")
+	mf, err := manifest.Load(mfPath)
+	if err != nil {
+		return err
+	}
+
+	diff, err := compiler.Diff(dir, cfg, mf)
+	if err != nil {
+		return err
+	}
+
+	totalSources := len(diff.Added) + len(diff.Modified)
+	if totalSources == 0 {
+		fmt.Println("Nothing to compile — wiki is up to date.")
+		return nil
+	}
+
+	// Count total bytes of source content
+	var totalBytes int
+	for _, s := range append(diff.Added, diff.Modified...) {
+		absPath := filepath.Join(dir, s.Path)
+		info, err := os.Stat(absPath)
+		if err == nil {
+			totalBytes += int(info.Size())
+		}
+	}
+
+	model := cfg.Models.Summarize
+	if model == "" {
+		model = "gemini-2.5-flash"
+	}
+
+	tokens, cost := llm.EstimateFromBytes(totalBytes, cfg.API.Provider, model, 0)
+
+	fmt.Printf("\n📊 Cost estimate for %d sources (%d new, %d modified)\n",
+		totalSources, len(diff.Added), len(diff.Modified))
+	fmt.Printf("   Model:    %s (%s)\n", model, cfg.API.Provider)
+	fmt.Printf("   Tokens:   ~%d input (estimated)\n", tokens)
+	fmt.Printf("   Cost:     ~$%.4f (standard mode)\n", cost)
+	fmt.Printf("   Batch:    ~$%.4f (50%% discount, if available)\n", cost*0.5)
+	fmt.Printf("   Cached:   ~$%.4f (with prompt caching)\n", cost*0.3)
+	fmt.Println()
+	fmt.Println("   Note: estimates are approximate. Actual cost depends on")
+	fmt.Println("   content complexity, output length, and provider pricing.")
+	fmt.Println()
+
 	return nil
 }
 
