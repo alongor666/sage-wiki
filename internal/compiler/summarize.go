@@ -36,6 +36,7 @@ func Summarize(
 	maxTokens int,
 	maxParallel int,
 	userTZ *time.Location,
+	language string,
 ) []SummaryResult {
 	if maxParallel <= 0 {
 		maxParallel = 4
@@ -55,7 +56,7 @@ func Summarize(
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ)
+			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ, language)
 			results[idx] = result
 
 			n := int(done.Add(1))
@@ -79,6 +80,7 @@ func summarizeOne(
 	model string,
 	maxTokens int,
 	userTZ *time.Location,
+	language string,
 ) SummaryResult {
 	result := SummaryResult{SourcePath: info.Path}
 
@@ -112,6 +114,17 @@ func summarizeOne(
 	if _, err := prompts.Render(templateName, prompts.SummarizeData{}); err != nil {
 		templateName = "summarize_article" // fallback for unknown types
 	}
+	// Override to structured template if document matches structured heuristics
+	if isStructuredDocument(content.Text) {
+		templateName = "summarize_structured"
+		log.Info("detected structured document, using structured template", "source", info.Path)
+	}
+
+	// Build language instruction suffix
+	langSuffix := ""
+	if language != "" {
+		langSuffix = fmt.Sprintf("\n\nIMPORTANT: Write the summary in %s.", languageDisplayName(language))
+	}
 
 	if content.ChunkCount <= 1 {
 		// Single-chunk summarization
@@ -127,7 +140,7 @@ func summarizeOne(
 
 		resp, err := client.ChatCompletion([]llm.Message{
 			{Role: "system", Content: "You are a research assistant creating structured summaries for a personal knowledge wiki."},
-			{Role: "user", Content: prompt + "\n\n---\n\nSource content:\n\n" + content.Text},
+			{Role: "user", Content: prompt + langSuffix + "\n\n---\n\nSource content:\n\n" + content.Text},
 		}, llm.CallOpts{Model: model, MaxTokens: maxTokens})
 		if err != nil {
 			result.Error = fmt.Errorf("llm call: %w", err)
@@ -137,7 +150,7 @@ func summarizeOne(
 		summaryText = resp.Content
 	} else {
 		// Multi-chunk: summarize each chunk, then synthesize hierarchically
-		chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens)
+		chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens, langSuffix)
 		if err != nil {
 			result.Error = err
 			return result
@@ -228,6 +241,7 @@ func summarizeChunks(
 	client *llm.Client,
 	model string,
 	maxTokens int,
+	langSuffix string,
 ) ([]string, error) {
 	// Group chunks if per-chunk budget is too low
 	groups := groupChunks(chunks, maxTokens)
@@ -267,7 +281,7 @@ func summarizeChunks(
 
 		resp, err := client.ChatCompletion([]llm.Message{
 			{Role: "system", Content: "You are summarizing a section of a larger document."},
-			{Role: "user", Content: prompt + "\n\n---\n\nSection:\n\n" + groupText.String()},
+			{Role: "user", Content: prompt + langSuffix + "\n\n---\n\nSection:\n\n" + groupText.String()},
 		}, llm.CallOpts{Model: model, MaxTokens: perGroupBudget})
 		if err != nil {
 			return nil, fmt.Errorf("group %d llm: %w", gi, err)
@@ -364,6 +378,64 @@ func synthesizeHierarchical(summaries []string, sourcePath string, client *llm.C
 	}
 
 	return summaries[0], nil
+}
+
+// isStructuredDocument uses heuristics to detect whether a document is a
+// structured reference (registry, dictionary, catalog, spec) rather than
+// a narrative article. Structured documents benefit from entry-preserving
+// summarization instead of narrative compression.
+func isStructuredDocument(text string) bool {
+	lines := strings.Split(text, "\n")
+	if len(lines) < 10 {
+		return false
+	}
+
+	// Heuristic 1: High density of repeated heading patterns (### Name + fields)
+	h3Count := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "#### ") {
+			h3Count++
+		}
+	}
+	if h3Count >= 5 {
+		return true
+	}
+
+	// Heuristic 2: High density of definition-list patterns (- **Key**: value)
+	boldKeyCount := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- **") || strings.HasPrefix(trimmed, "* **") {
+			boldKeyCount++
+		}
+	}
+	if boldKeyCount >= 10 {
+		return true
+	}
+
+	// Heuristic 3: High density of code blocks (SQL, config, etc.)
+	codeBlockCount := 0
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			codeBlockCount++
+		}
+	}
+	if codeBlockCount >= 6 && h3Count >= 3 {
+		return true
+	}
+
+	// Heuristic 4: Table-heavy documents (| col | col |)
+	tableRowCount := 0
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "|") && strings.Count(line, "|") >= 3 {
+			tableRowCount++
+		}
+	}
+	if tableRowCount >= 10 {
+		return true
+	}
+
+	return false
 }
 
 func detectImageMime(path string) string {

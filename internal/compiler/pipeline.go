@@ -251,7 +251,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		maxTokens = 2000
 	}
 
-	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation())
+	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation(), cfg.Language)
 
 	for _, sr := range summaries {
 		if sr.Error != nil {
