@@ -80,6 +80,7 @@ func isCJK(r rune) bool {
 }
 
 // ChunkIfNeeded splits content into chunks if it exceeds maxTokens.
+// Uses adaptive estimation: ~1.5 chars/token for CJK-heavy text, ~4 chars/token for ASCII.
 func ChunkIfNeeded(content *SourceContent, maxTokens int) {
 	estimatedTokens := EstimateTokens(content.Text)
 	if estimatedTokens <= maxTokens || maxTokens <= 0 {
@@ -239,6 +240,7 @@ func splitByHeadings(text string, maxTokens int) []Chunk {
 	flush()
 	return chunks
 }
+
 
 // stripHeadingPrefix removes markdown heading markers (# ## ###) from a line.
 func stripHeadingPrefix(line string) string {

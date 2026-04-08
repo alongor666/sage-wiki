@@ -115,11 +115,14 @@ func writeOneArticle(
 
 Rules:
 1. ONLY describe what the source documents actually contain. If a source describes a specific project implementation, describe THAT implementation, not the general concept from Wikipedia.
-2. Use [[wikilinks]] in lowercase-hyphenated format for related concepts.
-3. Output raw Markdown only. Do NOT wrap output in code fences. Do NOT include YAML frontmatter.
-4. Start directly with the first section heading.`
+2. When the sources contain SQL, formulas, code, directory structures, or data tables — QUOTE THEM DIRECTLY in your article using code blocks or markdown tables. Do not paraphrase "the system uses SQL expressions" when you can show the actual SQL.
+3. Use tables to present structured information (field lists, category breakdowns, comparison data). Prefer tables over bullet lists for multi-attribute data.
+4. Use [[wikilinks]] in lowercase-hyphenated format ONLY. Never use Chinese characters in wikilinks (use [[module-boundary]] not [[模块边界]]).
+5. Output raw Markdown only. Do NOT wrap output in code fences. Do NOT include YAML frontmatter.
+6. Start directly with the first section heading.
+7. For Variants and Trade-offs sections: if the source does not explicitly discuss alternatives or trade-offs, infer practical trade-offs from the engineering constraints described (e.g., "strict isolation limits code reuse"). Never write "源文档未提及" — always provide substantive analysis.`
 	if language != "" {
-		systemPrompt += fmt.Sprintf("\n5. Write ALL content (including section titles) in %s.", languageDisplayName(language))
+		systemPrompt += fmt.Sprintf("\n8. Write ALL content (including section titles) in %s.", languageDisplayName(language))
 	}
 
 	resp, err := client.ChatCompletion([]llm.Message{
