@@ -149,18 +149,31 @@ func summarizeOne(
 
 		summaryText = resp.Content
 	} else {
-		// Multi-chunk: summarize each chunk, then synthesize hierarchically
-		chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens, langSuffix)
-		if err != nil {
-			result.Error = err
-			return result
-		}
+		// Multi-chunk: check for table-heavy documents first
+		tableHeavy := extract.IsTableHeavy(content)
 
-		// Hierarchical synthesis: reduce in groups until we have a single summary
-		summaryText, err = synthesizeHierarchical(chunkSummaries, info.Path, client, model, maxTokens)
-		if err != nil {
-			result.Error = err
-			return result
+		if tableHeavy && content.ChunkCount >= 4 {
+			// Large table document: use specialized schema→sample→synthesis strategy
+			text, err := summarizeTableHeavyDocument(info, content, client, model, maxTokens, langSuffix)
+			if err != nil {
+				result.Error = err
+				return result
+			}
+			summaryText = text
+		} else {
+			// Standard multi-chunk: summarize each chunk, then synthesize hierarchically
+			chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens, langSuffix)
+			if err != nil {
+				result.Error = err
+				return result
+			}
+
+			// Hierarchical synthesis: reduce in groups until we have a single summary
+			summaryText, err = synthesizeHierarchical(chunkSummaries, info.Path, client, model, maxTokens)
+			if err != nil {
+				result.Error = err
+				return result
+			}
 		}
 	}
 
@@ -378,6 +391,121 @@ func synthesizeHierarchical(summaries []string, sourcePath string, client *llm.C
 	}
 
 	return summaries[0], nil
+}
+
+// summarizeTableHeavyDocument uses a schema→sample→synthesis strategy for large table documents.
+func summarizeTableHeavyDocument(
+	info SourceInfo,
+	content *extract.SourceContent,
+	client *llm.Client,
+	model string,
+	maxTokens int,
+	langSuffix string,
+) (string, error) {
+	// Pass 1: Extract schema from first chunk (has table header)
+	schemaPrompt := fmt.Sprintf(
+		`This is chunk 1 of %d from a large markdown table document: %q.
+Extract:
+1. Table column names and their semantic meaning
+2. Estimated total row count (based on this chunk's row density and total chunks)
+3. Sample 3-5 representative rows in markdown table format
+4. Key patterns you observe (value ranges, naming conventions, distributions)
+
+Output as markdown.%s`,
+		len(content.Chunks), info.Path, langSuffix,
+	)
+
+	schemaTokens := maxTokens / 2
+	schemaResp, err := client.ChatCompletion([]llm.Message{
+		{Role: "system", Content: "You are extracting schema and statistics from a large data table."},
+		{Role: "user", Content: schemaPrompt + "\n\n---\n\n" + content.Chunks[0].Text},
+	}, llm.CallOpts{Model: model, MaxTokens: schemaTokens})
+	if err != nil {
+		return "", fmt.Errorf("table schema extraction: %w", err)
+	}
+
+	// Pass 2: Sample middle chunks for value diversity
+	var samples []string
+	sampleChunks := selectSampleChunks(content.Chunks, 3)
+	for _, chunk := range sampleChunks {
+		samplePrompt := fmt.Sprintf(
+			`From this chunk of the table %q, extract 3-5 representative or interesting rows as a markdown table fragment. Focus on diversity — pick rows that show the range of values.%s`,
+			info.Path, langSuffix,
+		)
+		sr, err := client.ChatCompletion([]llm.Message{
+			{Role: "system", Content: "You are sampling representative rows from a large data table."},
+			{Role: "user", Content: samplePrompt + "\n\n---\n\n" + chunk.Text},
+		}, llm.CallOpts{Model: model, MaxTokens: 300})
+		if err != nil {
+			log.Warn("table sample failed", "source", info.Path, "chunk", chunk.Index, "error", err)
+			continue // skip failed samples, non-fatal
+		}
+		samples = append(samples, sr.Content)
+	}
+	if len(samples) == 0 && len(sampleChunks) > 0 {
+		log.Warn("all table samples failed, synthesis will rely on schema only", "source", info.Path)
+	}
+
+	// Pass 3: Synthesize into structured table summary
+	synthesisPrompt := fmt.Sprintf(
+		`Create a structured summary of the large table document %q.
+
+You have schema analysis and %d sample chunks below.
+
+Write a summary with these sections:
+## Table Overview
+What this table is, estimated row count, and its purpose.
+
+## Column Definitions
+Each column: name, type/meaning, example values.
+
+## Data Patterns
+Naming conventions, value distributions, notable patterns.
+
+## Representative Records
+Markdown table with 5-10 diverse rows showing the range of data.%s
+
+---
+SCHEMA ANALYSIS:
+%s
+
+---
+SAMPLES:
+%s`,
+		info.Path,
+		len(samples),
+		langSuffix,
+		schemaResp.Content,
+		strings.Join(samples, "\n\n---\n\n"),
+	)
+
+	finalResp, err := client.ChatCompletion([]llm.Message{
+		{Role: "system", Content: "You are creating a structured summary of a large database table for a knowledge wiki."},
+		{Role: "user", Content: synthesisPrompt},
+	}, llm.CallOpts{Model: model, MaxTokens: maxTokens})
+	if err != nil {
+		return "", fmt.Errorf("table synthesis: %w", err)
+	}
+
+	return finalResp.Content, nil
+}
+
+// selectSampleChunks picks up to n evenly-spaced chunks from the middle of the list,
+// excluding the first chunk (which is used for schema extraction).
+func selectSampleChunks(chunks []extract.Chunk, n int) []extract.Chunk {
+	if len(chunks) <= 1 {
+		return nil
+	}
+	rest := chunks[1:] // skip first (schema) chunk
+	if len(rest) <= n {
+		return rest
+	}
+	var selected []extract.Chunk
+	step := len(rest) / n
+	for i := 0; i < n; i++ {
+		selected = append(selected, rest[i*step])
+	}
+	return selected
 }
 
 // isStructuredDocument uses heuristics to detect whether a document is a
