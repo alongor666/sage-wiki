@@ -16,14 +16,23 @@ import (
 	"github.com/xoai/sage-wiki/internal/log"
 	"github.com/xoai/sage-wiki/internal/memory"
 	"github.com/xoai/sage-wiki/internal/ontology"
+	"github.com/xoai/sage-wiki/internal/quality"
 	"github.com/xoai/sage-wiki/internal/vectors"
+)
+
+// Package-level compiled regexps (avoid recompilation in goroutines).
+var (
+	reWikilink       = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+	reOuterCodeFence = regexp.MustCompile("(?s)^```(?:markdown|md)?\\s*\n(.*?)\\s*```\\s*$")
 )
 
 // ArticleResult holds the output of writing a concept article.
 type ArticleResult struct {
-	ConceptName string
-	ArticlePath string
-	Error       error
+	ConceptName  string
+	ArticlePath  string
+	Error        error
+	QualityScore *quality.ArticleScore
+	NeedsRework  bool
 }
 
 // WriteArticles runs Pass 3: write concept articles with ontology edges.
@@ -120,9 +129,10 @@ Rules:
 4. Use [[wikilinks]] in lowercase-hyphenated format ONLY. Never use Chinese characters in wikilinks (use [[module-boundary]] not [[模块边界]]).
 5. Output raw Markdown only. Do NOT wrap output in code fences. Do NOT include YAML frontmatter.
 6. Start directly with the first section heading.
-7. For Variants and Trade-offs sections: if the source does not explicitly discuss alternatives or trade-offs, infer practical trade-offs from the engineering constraints described (e.g., "strict isolation limits code reuse"). Never write "源文档未提及" — always provide substantive analysis.`
+7. For 变体/Variants section: list ONLY variations explicitly named in the sources. If none exist, state one plausible alternative approach NOT taken, with a brief reason why.
+8. For 权衡/Trade-offs section: analyze from these angles — pick the 2-3 most applicable: (a) rigidity vs flexibility, (b) coupling vs isolation, (c) standardization cost vs consistency benefit, (d) operational overhead. Write at least 2 sentences per point. NEVER write "源文档未提及", "未详细说明", or "no explicit mention".`
 	if language != "" {
-		systemPrompt += fmt.Sprintf("\n8. Write ALL content (including section titles) in %s.", languageDisplayName(language))
+		systemPrompt += fmt.Sprintf("\n9. Write ALL content (including section titles) in %s.", languageDisplayName(language))
 	}
 
 	resp, err := client.ChatCompletion([]llm.Message{
@@ -157,6 +167,13 @@ Rules:
 
 	// Normalize confidence values to enum (high/medium/low)
 	articleContent = normalizeConfidence(articleContent)
+
+	// Sanitize Chinese wikilinks → english kebab-case
+	knownConcepts := buildConceptAliasMap(ontStore, concept)
+	articleContent = sanitizeWikilinks(articleContent, knownConcepts)
+
+	// Strip anti-pattern sentences (LLM ignoring prompt rules)
+	articleContent = stripAntiPatternSentences(articleContent)
 
 	// Note: wikilinks are kept even if targets don't exist yet.
 	// Future compiles will create the missing articles, and the links
@@ -232,6 +249,16 @@ Rules:
 		}
 	}
 
+	// Quality scoring (zero LLM calls)
+	qs := quality.DefaultScorer().ScoreArticle(concept.Name, articleContent, sourceContext)
+	result.QualityScore = &qs
+	if qs.Composite < 0.4 {
+		result.NeedsRework = true
+		log.Warn("low quality article", "concept", concept.Name, "composite", fmt.Sprintf("%.2f", qs.Composite), "antiPatterns", qs.AntiPatterns)
+	} else if qs.Composite < 0.6 {
+		log.Info("moderate quality article", "concept", concept.Name, "composite", fmt.Sprintf("%.2f", qs.Composite))
+	}
+
 	return result
 }
 
@@ -254,6 +281,24 @@ func buildArticlePrompt(concept ExtractedConcept, existing string, related []str
 		b.WriteString("\n--- SOURCE SUMMARIES (base your article ONLY on this content) ---\n")
 		b.WriteString(sourceContext)
 		b.WriteString("\n--- END SOURCE SUMMARIES ---\n")
+	}
+
+	// Conditional few-shot: when sources contain code, show good vs bad example
+	if sourceHasCode(sourceContext) {
+		b.WriteString(`
+QUALITY EXAMPLE — follow this pattern:
+
+BAD (do not write like this):
+"满期赔付率在 CTE 中预计算，使用 exposure_days 字段。"
+
+GOOD (write like this instead):
+满期赔付率使用以下 SQL 计算：
+` + "```sql\n" + `exposure_days = LEAST(GREATEST(DATEDIFF(day, start_date, end_date), 0), 365)
+earned_claim_ratio = SUM(claim_amount) / NULLIF(SUM(premium * exposure_days / 365.0), 0)
+` + "```\n" + `
+When sources contain SQL, formulas, config, or tables — reproduce them verbatim in code blocks or markdown tables. Never describe structure when you can show it.
+
+`)
 	}
 
 	if existing != "" {
@@ -524,8 +569,7 @@ func sanitizeID(s string) string {
 func stripOuterCodeFence(content string) string {
 	trimmed := strings.TrimSpace(content)
 	// Match ```markdown, ```md, or plain ```
-	re := regexp.MustCompile("(?s)^```(?:markdown|md)?\\s*\n(.*?)\\s*```\\s*$")
-	if m := re.FindStringSubmatch(trimmed); len(m) == 2 {
+	if m := reOuterCodeFence.FindStringSubmatch(trimmed); len(m) == 2 {
 		return strings.TrimSpace(m[1])
 	}
 	return content
@@ -595,12 +639,114 @@ func mapConfidence(value string) string {
 	}
 }
 
+// antiPatternPhrases are sentences the LLM generates despite prompt rules forbidding them.
+// Post-processing is more reliable than prompt-only prevention for weaker models.
+var antiPatternPhrases = []string{
+	"源文档未提及",
+	"未详细说明",
+	"源文档中未",
+	"文档未提及",
+	"没有明确",
+	"no explicit mention",
+	"not explicitly discussed",
+	"not mentioned in the source",
+}
+
+// stripAntiPatternSentences removes sentences containing anti-pattern phrases.
+// Operates line-by-line: if a line contains an anti-pattern, the entire line is removed.
+// Preserves headings and structural elements.
+func stripAntiPatternSentences(content string) string {
+	lines := strings.Split(content, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Never remove headings, code blocks, tables, or empty lines
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") ||
+			strings.HasPrefix(trimmed, "```") ||
+			strings.HasPrefix(trimmed, "|") ||
+			strings.HasPrefix(trimmed, "---") {
+			result = append(result, line)
+			continue
+		}
+		// Check for anti-pattern phrases
+		lower := strings.ToLower(trimmed)
+		hasAnti := false
+		for _, ap := range antiPatternPhrases {
+			if strings.Contains(lower, strings.ToLower(ap)) {
+				hasAnti = true
+				break
+			}
+		}
+		if !hasAnti {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
+// sourceHasCode returns true if the source context contains code blocks or SQL keywords.
+func sourceHasCode(sourceContext string) bool {
+	return strings.Contains(sourceContext, "```") ||
+		strings.Contains(sourceContext, "SELECT ") ||
+		strings.Contains(sourceContext, "CREATE TABLE") ||
+		strings.Contains(sourceContext, "SUM(") ||
+		strings.Contains(sourceContext, "COUNT(")
+}
+
+// containsCJK returns true if the string contains any CJK Unified Ideograph character.
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeWikilinks converts Chinese wikilinks to English kebab-case using known concept aliases.
+// Unknown Chinese links are stripped of brackets (kept as plain text).
+func sanitizeWikilinks(content string, knownConcepts map[string]string) string {
+	return reWikilink.ReplaceAllStringFunc(content, func(match string) string {
+		target := match[2 : len(match)-2]
+		if !containsCJK(target) {
+			return match
+		}
+		if kebab, ok := knownConcepts[target]; ok {
+			return "[[" + kebab + "]]"
+		}
+		// No mapping found — remove wikilink markup, keep text
+		return target
+	})
+}
+
+// buildConceptAliasMap constructs a reverse mapping from Chinese aliases to English concept IDs
+// for wikilink sanitization.
+func buildConceptAliasMap(ontStore *ontology.Store, current ExtractedConcept) map[string]string {
+	m := make(map[string]string)
+	// Add current concept's own aliases
+	for _, alias := range current.Aliases {
+		if containsCJK(alias) {
+			m[alias] = current.Name
+		}
+	}
+	// Add all known entities from the ontology store
+	if ontStore != nil {
+		if entities, err := ontStore.ListEntities(""); err == nil {
+			for _, e := range entities {
+				if containsCJK(e.Name) {
+					m[e.Name] = e.ID
+				}
+			}
+		}
+	}
+	return m
+}
+
 // validateWikilinks removes [[links]] that point to non-existent concept articles.
 func validateWikilinks(projectDir, outputDir, content string) string {
 	conceptsDir := filepath.Join(projectDir, outputDir, "concepts")
 
-	re := regexp.MustCompile(`\[\[([^\]]+)\]\]`)
-	return re.ReplaceAllStringFunc(content, func(match string) string {
+	return reWikilink.ReplaceAllStringFunc(content, func(match string) string {
 		target := match[2 : len(match)-2] // strip [[ and ]]
 
 		// Check if article exists
