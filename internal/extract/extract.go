@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // SourceContent holds extracted text from a source file.
@@ -56,10 +57,31 @@ func Extract(path string, sourceType string) (*SourceContent, error) {
 	}
 }
 
+// EstimateTokens estimates token count for mixed-script text.
+// Latin/ASCII: ~4 chars per token. CJK: ~1.5 tokens per character.
+func EstimateTokens(text string) int {
+	var cjk, other int
+	for _, r := range text {
+		if isCJK(r) {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	return int(float64(cjk)*1.5) + other/4
+}
+
+// isCJK returns true if the rune is a CJK ideograph or syllable.
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		unicode.Is(unicode.Hangul, r) ||
+		unicode.Is(unicode.Katakana, r) ||
+		unicode.Is(unicode.Hiragana, r)
+}
+
 // ChunkIfNeeded splits content into chunks if it exceeds maxTokens.
-// Uses a rough estimate of 4 chars per token.
 func ChunkIfNeeded(content *SourceContent, maxTokens int) {
-	estimatedTokens := len(content.Text) / 4
+	estimatedTokens := EstimateTokens(content.Text)
 	if estimatedTokens <= maxTokens || maxTokens <= 0 {
 		content.Chunks = []Chunk{{Index: 0, Text: content.Text}}
 		content.ChunkCount = 1
@@ -178,6 +200,7 @@ func splitByHeadings(text string, maxTokens int) []Chunk {
 	var current strings.Builder
 	var currentHeading string
 	chunkIdx := 0
+	runningTokens := 0
 
 	flush := func() {
 		if current.Len() > 0 {
@@ -188,6 +211,7 @@ func splitByHeadings(text string, maxTokens int) []Chunk {
 			})
 			chunkIdx++
 			current.Reset()
+			runningTokens = 0
 		}
 	}
 
@@ -195,8 +219,8 @@ func splitByHeadings(text string, maxTokens int) []Chunk {
 		isHeading := strings.HasPrefix(line, "# ") || strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ")
 
 		// Check if adding this line would exceed limit
-		estimatedTokens := (current.Len() + len(line)) / 4
-		if estimatedTokens > maxTokens && current.Len() > 0 {
+		lineTokens := EstimateTokens(line)
+		if runningTokens+lineTokens > maxTokens && current.Len() > 0 {
 			flush()
 		}
 
@@ -209,6 +233,7 @@ func splitByHeadings(text string, maxTokens int) []Chunk {
 
 		current.WriteString(line)
 		current.WriteString("\n")
+		runningTokens += lineTokens + 1 // +1 for the newline token
 	}
 
 	flush()
@@ -233,19 +258,21 @@ func splitByParagraphs(text string, maxTokens int) []Chunk {
 	var chunks []Chunk
 	var current strings.Builder
 	chunkIdx := 0
-	maxChars := maxTokens * 4
-
+	runningTokens := 0
 	for _, para := range paragraphs {
-		if current.Len()+len(para) > maxChars && current.Len() > 0 {
+		paraTokens := EstimateTokens(para)
+		if runningTokens+paraTokens > maxTokens && current.Len() > 0 {
 			chunks = append(chunks, Chunk{
 				Index: chunkIdx,
 				Text:  strings.TrimSpace(current.String()),
 			})
 			chunkIdx++
 			current.Reset()
+			runningTokens = 0
 		}
 		current.WriteString(para)
 		current.WriteString("\n\n")
+		runningTokens += paraTokens + 2 // +2 for paragraph separator newlines
 	}
 
 	if current.Len() > 0 {
